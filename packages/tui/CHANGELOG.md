@@ -73,6 +73,9 @@
 ### Fixed
 
 - Fixed AltGr characters, including `[`, `]`, `{`, and `}`, being dropped in Windows Terminal when using the kitty keyboard protocol on Hungarian and other international keyboard layouts ([#12984](https://github.com/can1357/oh-my-pi/pull/12984) by [@H4vC](https://github.com/H4vC)).
+### Fixed
+
+- Restored keyboard input after a stalled image paste instead of leaving the editor waiting indefinitely.
 
 ## [18.2.11] - 2026-09-23
 

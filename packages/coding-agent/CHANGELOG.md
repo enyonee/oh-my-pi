@@ -193,6 +193,7 @@
 - Fixed headless print mode dropping or silently ignoring MCP servers that start slowly; it now waits within the configured timeout and warns when a server is not ready.
 - Fixed reader-mode `fetch` sending inline SVG icons and base64 images as unreadable model input; alt text is retained instead.
 - Fixed long non-Latin judged TTSR output exceeding token limits by applying token-aware truncation.
+- Prevented a late clipboard image from appearing in a later draft after paste timeout.
 
 ## [18.2.11] - 2026-09-23
 

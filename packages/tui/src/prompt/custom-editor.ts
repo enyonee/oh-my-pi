@@ -75,6 +75,8 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
 };
 
+const ASYNC_PASTE_TIMEOUT_MS = 10_000;
+
 function buildMatchKeys(keys: readonly KeyId[]): Set<string> {
 	const matchKeys = new Set<string>();
 	for (const key of keys) {
@@ -879,9 +881,11 @@ export class CustomEditor extends Editor {
 	/** Called when the configured copy-prompt shortcut is pressed. */
 	onCopyPrompt?: () => void;
 	/** Called when the configured image-paste shortcut is pressed. */
-	onPasteImage?: () => Promise<boolean>;
+	onPasteImage?: (signal?: AbortSignal) => Promise<boolean>;
 	/** Called when a bracketed paste contains one or more image or video file paths. */
-	onPasteImagePath?: (path: string) => void | Promise<void>;
+	onPasteImagePath?: (path: string, signal?: AbortSignal) => void | Promise<void>;
+	/** Called if a bracketed image paste blocks keyboard input for too long. */
+	onPasteTimeout?: () => void;
 	/** Called when the configured raw text-paste shortcut is pressed. */
 	onPasteTextRaw?: () => void;
 	/** Called when the configured dequeue shortcut is pressed. */
@@ -981,25 +985,49 @@ export class CustomEditor extends Editor {
 		this.#rebuildCustomMatchKeys();
 	}
 
-	/** Decrement {@link #pasteInFlight} once an async paste settles and, when the count returns
-	 *  to zero, drain {@link #pendingInput} through `handleInput` so requeueing still works if a
-	 *  drained chunk triggers another async paste. Bound member so it can be passed straight to
-	 *  `Promise.then(callback, callback)`. */
-	#onPasteSettled = (): void => {
+	/** Release deferred input after an async paste settles. A timeout drops queued submit keys
+	 *  because sending the draft without the expected image would silently change its meaning. */
+	#onPasteSettled = (timedOut = false): void => {
 		this.#pasteInFlight--;
 		if (this.#pasteInFlight > 0) return;
 		const drained = this.#pendingInput.splice(0);
-		for (const chunk of drained) this.handleInput(chunk);
+		// An Enter queued for an image must not submit the draft without that image.
+		for (const chunk of drained) {
+			if (timedOut && this.#isSubmitKey(chunk)) continue;
+			this.handleInput(chunk);
+		}
 	};
 
-	/** Track `promise` as an in-flight paste so subsequent `handleInput` calls queue behind it,
-	 *  then drain the queue once it settles. Codex PR #3602 review: without this, a trailing
+	/** Track an in-flight paste so subsequent `handleInput` calls queue behind it,
+	 *  then drain the queue once it settles or times out. Codex PR #3602 review: without this, a trailing
 	 *  keystroke (Enter most painfully) in the same stdin read processes synchronously while the
 	 *  clipboard read is still pending — submit fires with the text but `pendingImages` is still
 	 *  empty and the image lands on the *next* draft instead. */
-	#trackAsyncPaste(promise: Promise<unknown>): void {
+	#trackAsyncPaste(run: (signal: AbortSignal) => Promise<unknown>): void {
 		this.#pasteInFlight++;
-		void promise.then(this.#onPasteSettled, this.#onPasteSettled);
+		const controller = new AbortController();
+		let settled = false;
+		const settle = (timedOut = false): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			this.#onPasteSettled(timedOut);
+		};
+		const timer = setTimeout(() => {
+			controller.abort();
+			settle(true);
+			this.onPasteTimeout?.();
+		}, ASYNC_PASTE_TIMEOUT_MS);
+		timer.unref?.();
+		try {
+			void run(controller.signal).then(
+				() => settle(),
+				() => settle(),
+			);
+		} catch (error) {
+			settle();
+			throw error;
+		}
 	}
 
 	override handleInput(data: string): void {
@@ -1041,16 +1069,17 @@ export class CustomEditor extends Editor {
 			// completes — fixes the race where submit runs against an empty `pendingImages`.
 			if (remaining.length > 0) this.#pendingInput.push(remaining);
 			if (content.length === 0 && this.onPasteImage) {
-				this.#trackAsyncPaste(Promise.resolve(this.onPasteImage()));
+				this.#trackAsyncPaste(signal => Promise.resolve(this.onPasteImage?.(signal)));
 				return;
 			}
 			const attachmentPaths = extractImagePastePathsFromText(content);
 			if (attachmentPaths && this.onPasteImagePath) {
-				this.#trackAsyncPaste(
-					(async () => {
-						for (const p of attachmentPaths) await this.onPasteImagePath?.(p);
-					})(),
-				);
+				this.#trackAsyncPaste(async signal => {
+					for (const p of attachmentPaths) {
+						if (signal.aborted) return;
+						await this.onPasteImagePath?.(p, signal);
+					}
+				});
 				return;
 			}
 			// A submit key that shared the read (see `StdinBuffer`'s paste event) is
