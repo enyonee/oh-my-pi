@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented a late clipboard image from appearing in a later draft after paste timeout.
+
 ## [18.2.11] - 2026-09-23
 
 ### Fixed

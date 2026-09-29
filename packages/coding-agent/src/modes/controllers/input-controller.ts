@@ -620,8 +620,10 @@ export class InputController {
 			"app.clipboard.pasteImage",
 			this.ctx.keybindings.getKeys("app.clipboard.pasteImage"),
 		);
-		this.ctx.editor.onPasteImage = () => this.handleImagePaste();
-		this.ctx.editor.onPasteImagePath = path => this.handleImagePathPaste(path);
+		this.ctx.editor.onPasteImage = signal => this.handleImagePaste(signal);
+		this.ctx.editor.onPasteImagePath = (path, signal) => this.handleImagePathPaste(path, signal);
+		this.ctx.editor.onPasteTimeout = () =>
+			this.ctx.showStatus("Image paste timed out. Press Enter again to send without it.");
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.pasteTextRaw",
 			this.ctx.keybindings.getKeys("app.clipboard.pasteTextRaw"),
@@ -1835,7 +1837,11 @@ export class InputController {
 		return entries.length;
 	}
 
-	async #insertPendingImage(imageData: ImageContent, source?: ImageAttachmentSource): Promise<void> {
+	async #insertPendingImage(
+		imageData: ImageContent,
+		source?: ImageAttachmentSource,
+		signal?: AbortSignal,
+	): Promise<void> {
 		const image: ImageContent = source
 			? tagImageAttachmentSource(imageData, source.path, source.kind)
 			: { type: "image", data: imageData.data, mimeType: imageData.mimeType };
@@ -1846,11 +1852,13 @@ export class InputController {
 			(
 				await materializeImageReferenceLinks([image], this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager))
 			)?.[0];
+		if (signal?.aborted) return;
+		const dims = await this.#imageDimensions(imageData);
+		if (signal?.aborted) return;
 		this.ctx.editor.pendingImages.push(image);
 		this.ctx.editor.pendingImageLinks.push(imageLink);
 		this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 		const imageNum = this.ctx.editor.pendingImages.length;
-		const dims = await this.#imageDimensions(imageData);
 		setCachedImageDimensions(image, dims ?? null);
 		const kind = source?.kind ?? "image";
 		// The buffer holds the compact chip token; the atom table expands it to the bracketed
@@ -1874,8 +1882,13 @@ export class InputController {
 		return undefined;
 	}
 
-	async #normalizePastedImage(image: ImageContent, unsupportedMessage: string): Promise<ImageContent | null> {
+	async #normalizePastedImage(
+		image: ImageContent,
+		unsupportedMessage: string,
+		signal?: AbortSignal,
+	): Promise<ImageContent | null> {
 		let imageData = await ensureSupportedImageInput(image);
+		if (signal?.aborted) return null;
 		if (!imageData) {
 			this.ctx.showStatus(unsupportedMessage);
 			return null;
@@ -1887,6 +1900,7 @@ export class InputController {
 					data: imageData.data,
 					mimeType: imageData.mimeType,
 				});
+				if (signal?.aborted) return null;
 				imageData = { type: "image", data: resized.data, mimeType: resized.mimeType };
 			} catch {
 				// Keep the normalized image when resize fails.
@@ -1899,13 +1913,15 @@ export class InputController {
 		image: ImageContent,
 		unsupportedMessage: string,
 		sourcePath?: string,
+		signal?: AbortSignal,
 	): Promise<boolean> {
-		const normalized = await this.#normalizePastedImage(image, unsupportedMessage);
+		const normalized = await this.#normalizePastedImage(image, unsupportedMessage, signal);
 		if (!normalized) return false;
 		// A filesystem origin tags the attachment so the source path reaches the
 		// model via the hidden companion message (see AgentSession's attachment
 		// source notices); clipboard bitmaps stay untagged.
-		await this.#insertPendingImage(normalized, sourcePath ? { path: sourcePath, kind: "image" } : undefined);
+		await this.#insertPendingImage(normalized, sourcePath ? { path: sourcePath, kind: "image" } : undefined, signal);
+		if (signal?.aborted) return false;
 		return true;
 	}
 
@@ -1928,17 +1944,21 @@ export class InputController {
 	 * paste with an actionable status; ENOENT propagates to the caller's
 	 * clipboard-fallback handling.
 	 */
-	async #insertPendingVideoPreview(pastedPath: string): Promise<void> {
+	async #insertPendingVideoPreview(pastedPath: string, signal?: AbortSignal): Promise<void> {
 		try {
 			const absolutePath = resolveReadPath(pastedPath, this.ctx.sessionManager.getCwd());
 			const meta = await probeVideo(absolutePath);
+			if (signal?.aborted) return;
 			const sheet = await buildVideoContactSheetPng(absolutePath, meta);
+			if (signal?.aborted) return;
 			const preview = await this.#normalizePastedImage(
 				{ type: "image", data: sheet.png.data, mimeType: sheet.png.mimeType },
 				"Unsupported pasted video preview format",
+				signal,
 			);
-			if (preview) await this.#insertPendingImage(preview, { path: absolutePath, kind: "video" });
+			if (preview) await this.#insertPendingImage(preview, { path: absolutePath, kind: "video" }, signal);
 		} catch (error) {
+			if (signal?.aborted) return;
 			if (error instanceof VideoError) {
 				this.ctx.editor.pasteText(pastedPath);
 				this.ctx.ui.requestRender();
@@ -1949,15 +1969,18 @@ export class InputController {
 		}
 	}
 
-	async #tryPasteClipboardImage(): Promise<boolean> {
+	async #tryPasteClipboardImage(signal?: AbortSignal): Promise<boolean> {
 		const env = process.env;
 		if (env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT) return false;
 		try {
 			const image = await this.clipboard.readImage();
+			if (signal?.aborted) return false;
 			if (!image) return false;
 			await this.#normalizeAndInsertPastedImage(
 				{ type: "image", data: image.data.toBase64(), mimeType: image.mimeType },
 				`Unsupported clipboard image format: ${image.mimeType}`,
+				undefined,
+				signal,
 			);
 			return true;
 		} catch {
@@ -1965,10 +1988,10 @@ export class InputController {
 		}
 	}
 
-	async handleImagePathPaste(path: string): Promise<void> {
+	async handleImagePathPaste(path: string, signal?: AbortSignal): Promise<void> {
 		try {
 			if (isVideoPath(path)) {
-				await this.#insertPendingVideoPreview(path);
+				await this.#insertPendingVideoPreview(path, signal);
 				return;
 			}
 			const image = await loadImageInput({
@@ -1976,10 +1999,12 @@ export class InputController {
 				cwd: this.ctx.sessionManager.getCwd(),
 				autoResize: false,
 			});
+			if (signal?.aborted) return;
 			if (!image) {
 				// Path resolved but is not a readable image (e.g. a zero-byte or
 				// locked transient screenshot file). Prefer the clipboard bytes.
-				if (await this.#tryPasteClipboardImage()) return;
+				if (await this.#tryPasteClipboardImage(signal)) return;
+				if (signal?.aborted) return;
 				this.ctx.editor.pasteText(path);
 				this.ctx.ui.requestRender();
 				this.ctx.showStatus("Pasted path is not a supported image");
@@ -1989,8 +2014,10 @@ export class InputController {
 				{ type: "image", data: image.data, mimeType: image.mimeType },
 				`Unsupported pasted image format: ${image.mimeType}`,
 				image.resolvedPath,
+				signal,
 			);
 		} catch (error) {
+			if (signal?.aborted) return;
 			if (error instanceof ImageInputTooLargeError) {
 				this.ctx.editor.pasteText(path);
 				this.ctx.ui.requestRender();
@@ -2001,7 +2028,8 @@ export class InputController {
 				// #2375: the bracketed paste forwarded by a local terminal carries a
 				// path on the *local* filesystem. The bytes may still be on the
 				// clipboard (Win+Shift+S), so try those before giving up.
-				if (await this.#tryPasteClipboardImage()) return;
+				if (await this.#tryPasteClipboardImage(signal)) return;
+				if (signal?.aborted) return;
 				// Over SSH the clipboard lives on the remote host, so the path is
 				// genuinely unreachable; pasting it as text would look like the
 				// image was attached when nothing was sent. Surface an SSH-aware
@@ -2025,14 +2053,15 @@ export class InputController {
 				);
 				return;
 			}
-			if (await this.#tryPasteClipboardImage()) return;
+			if (await this.#tryPasteClipboardImage(signal)) return;
+			if (signal?.aborted) return;
 			this.ctx.editor.pasteText(path);
 			this.ctx.ui.requestRender();
 			this.ctx.showStatus("Failed to read pasted image path");
 		}
 	}
 
-	async handleImagePaste(): Promise<boolean> {
+	async handleImagePaste(signal?: AbortSignal): Promise<boolean> {
 		let finishPaste: ((text: string | undefined) => boolean) | undefined;
 		try {
 			// When a modal paste-capable prompt (login/API-key Input) owns focus,
@@ -2064,11 +2093,13 @@ export class InputController {
 			// other platform this is a no-op and the bitmap read below still
 			// runs first.
 			const fileUrls = promptTarget ? [] : ((await this.clipboard.readMacFileUrls?.()) ?? []);
+			if (signal?.aborted) return false;
 			let attachedFromFileUrls = false;
 			for (const url of fileUrls) {
+				if (signal?.aborted) return false;
 				const candidate = extractImagePathFromText(url);
 				if (!candidate) continue;
-				await this.handleImagePathPaste(candidate);
+				await this.handleImagePathPaste(candidate, signal);
 				attachedFromFileUrls = true;
 			}
 			if (attachedFromFileUrls) return true;
@@ -2087,6 +2118,7 @@ export class InputController {
 				() => {},
 			);
 			const image = await this.clipboard.readImage();
+			if (signal?.aborted) return false;
 			if (image) {
 				if (promptTarget) {
 					this.ctx.showStatus("Image paste is not supported in this prompt");
@@ -2099,6 +2131,8 @@ export class InputController {
 						mimeType: image.mimeType,
 					},
 					`Unsupported clipboard image format: ${image.mimeType}`,
+					undefined,
+					signal,
 				);
 			}
 			// Smart paste (#1628): no image on the clipboard — fall back to
@@ -2107,6 +2141,7 @@ export class InputController {
 			// integrated terminal, Win+V clipboard history) deliver only
 			// this keypress, so a miss here must not dead-end.
 			const text = await textPromise;
+			if (signal?.aborted) return false;
 			if (!text) {
 				this.ctx.showStatus("Clipboard is empty");
 				return false;
@@ -2119,7 +2154,7 @@ export class InputController {
 			// terminals do this for image clipboards).
 			const imagePath = promptTarget ? null : extractImagePathFromText(text);
 			if (imagePath) {
-				await this.handleImagePathPaste(imagePath);
+				await this.handleImagePathPaste(imagePath, signal);
 				return true;
 			}
 			// Keep the initiating prompt as the only possible modal destination.
@@ -2135,6 +2170,7 @@ export class InputController {
 			this.ctx.ui.requestRender();
 			return true;
 		} catch {
+			if (signal?.aborted) return false;
 			this.ctx.showStatus("Failed to read clipboard");
 			return false;
 		} finally {

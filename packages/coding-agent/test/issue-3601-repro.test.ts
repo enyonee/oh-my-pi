@@ -59,6 +59,7 @@ function createCtx() {
 }
 
 describe("CustomEditor empty bracketed paste (issue #3601)", () => {
+	afterEach(() => vi.useRealTimers());
 	it("invokes onPasteImage for an empty bracketed paste so Cmd+V on image-only clipboards reaches the smart reader", () => {
 		const { editor } = createCtx();
 		const onPasteImage = vi.fn(async () => true);
@@ -110,7 +111,7 @@ describe("CustomEditor empty bracketed paste (issue #3601)", () => {
 		editor.handleInput(`${BRACKETED_PASTE_START}/tmp/screenshot.png${BRACKETED_PASTE_END}`);
 
 		// The image-path branch fires; the empty-paste branch must stay out of the way.
-		expect(onPasteImagePath).toHaveBeenCalledWith("/tmp/screenshot.png");
+		expect(onPasteImagePath).toHaveBeenCalledWith("/tmp/screenshot.png", expect.any(AbortSignal));
 		expect(onPasteImage).not.toHaveBeenCalled();
 	});
 
@@ -157,7 +158,7 @@ describe("CustomEditor empty bracketed paste (issue #3601)", () => {
 		editor.handleInput(`${BRACKETED_PASTE_START}/tmp/sc`);
 		editor.handleInput(`reenshot.png${BRACKETED_PASTE_END}`);
 
-		expect(onPasteImagePath).toHaveBeenCalledWith("/tmp/screenshot.png");
+		expect(onPasteImagePath).toHaveBeenCalledWith("/tmp/screenshot.png", expect.any(AbortSignal));
 	});
 
 	it("forwards a split text paste to the underlying editor exactly once (no double-insertion)", () => {
@@ -213,6 +214,56 @@ describe("CustomEditor empty bracketed paste (issue #3601)", () => {
 
 		expect(callOrder).toEqual(["paste:start", "enter"]);
 		expect(onEnter).toHaveBeenCalledTimes(1);
+	});
+
+	it("releases typing after a stalled image paste without submitting the image-less draft", async () => {
+		vi.useFakeTimers();
+		const { editor } = createCtx();
+		const pendingPaste = Promise.withResolvers<boolean>();
+		let signal: AbortSignal | undefined;
+		const onTimeout = vi.fn();
+		const onEnter = vi.fn();
+		editor.onPasteImage = receivedSignal => {
+			signal = receivedSignal;
+			return pendingPaste.promise;
+		};
+		editor.onPasteTimeout = onTimeout;
+		editor.setCustomKeyHandler("enter", onEnter);
+
+		editor.handleInput(`${BRACKETED_PASTE_START}${BRACKETED_PASTE_END}\r`);
+		editor.handleInput("x");
+		expect(editor.getText()).toBe("");
+		vi.advanceTimersByTime(9_999);
+		expect(editor.getText()).toBe("");
+		vi.advanceTimersByTime(1);
+
+		expect(signal?.aborted).toBe(true);
+		expect(editor.getText()).toBe("x");
+		expect(onEnter).not.toHaveBeenCalled();
+		expect(onTimeout).toHaveBeenCalledTimes(1);
+		pendingPaste.resolve(true);
+		await pendingPaste.promise;
+		await Promise.resolve();
+		expect(editor.getText()).toBe("x");
+		expect(onEnter).not.toHaveBeenCalled();
+	});
+
+	it("ignores an image clipboard result that arrives after the paste timeout", async () => {
+		vi.useFakeTimers();
+		const { ctx, editor } = createCtx();
+		const pendingImage = Promise.withResolvers<{ data: Buffer; mimeType: string } | null>();
+		const controller = new InputController(ctx, {
+			readImage: () => pendingImage.promise,
+			readText: async () => "",
+		});
+		editor.onPasteImage = signal => controller.handleImagePaste(signal);
+		editor.handleInput(`${BRACKETED_PASTE_START}${BRACKETED_PASTE_END}`);
+		vi.advanceTimersByTime(10_000);
+		pendingImage.resolve({ data: ONE_PX_PNG, mimeType: "image/png" });
+		await pendingImage.promise;
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(editor.pendingImages).toHaveLength(0);
+		expect(editor.getText()).toBe("");
 	});
 });
 
